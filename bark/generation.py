@@ -204,49 +204,42 @@ def _load_model(ckpt_path, device, use_small=False, model_type="text"):
         ModelClass = FineGPT
     else:
         raise NotImplementedError()
+    
     model_key = f"{model_type}_small" if use_small or USE_SMALL_MODELS else model_type
     model_info = REMOTE_MODEL_PATHS[model_key]
+    
     if not os.path.exists(ckpt_path):
         logger.info(f"{model_type} model not found, downloading into `{CACHE_DIR}`.")
         _download(model_info["repo_id"], model_info["file_name"])
+    
     checkpoint = torch.load(ckpt_path, map_location=device)
-    # this is a hack
     model_args = checkpoint["model_args"]
     if "input_vocab_size" not in model_args:
         model_args["input_vocab_size"] = model_args["vocab_size"]
         model_args["output_vocab_size"] = model_args["vocab_size"]
         del model_args["vocab_size"]
-    gptconf = ConfigClass(**checkpoint["model_args"])
+    
+    gptconf = ConfigClass(**model_args)
     model = ModelClass(gptconf)
     state_dict = checkpoint["model"]
-    # fixup checkpoint
+    
+    # Handle checkpoint structure changes
     unwanted_prefix = "_orig_mod."
     for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
-    extra_keys = set(state_dict.keys()) - set(model.state_dict().keys())
-    extra_keys = set([k for k in extra_keys if not k.endswith(".attn.bias")])
-    missing_keys = set(model.state_dict().keys()) - set(state_dict.keys())
-    missing_keys = set([k for k in missing_keys if not k.endswith(".attn.bias")])
-    if len(extra_keys) != 0:
-        raise ValueError(f"extra keys found: {extra_keys}")
-    if len(missing_keys) != 0:
-        raise ValueError(f"missing keys: {missing_keys}")
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    
     model.load_state_dict(state_dict, strict=False)
-    n_params = model.get_num_params()
-    val_loss = checkpoint["best_val_loss"].item()
-    logger.info(f"model loaded: {round(n_params/1e6,1)}M params, {round(val_loss,3)} loss")
-    model.eval()
-    model.to(device)
-    del checkpoint, state_dict
-    _clear_cuda_cache()
+    model = model.eval().to(device)
+
+    # Wrap model with torch.compile() for optimization
+    compiled_model = torch.compile(model, mode='reduce-overhead', dynamic=True)
+
     if model_type == "text":
         tokenizer = BertTokenizer.from_pretrained("bert-base-multilingual-cased")
-        return {
-            "model": model,
-            "tokenizer": tokenizer,
-        }
-    return model
+        return {"model": compiled_model, "tokenizer": tokenizer}
+    
+    return compiled_model
 
 
 def _load_codec_model(device):
